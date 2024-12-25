@@ -18,6 +18,8 @@ import torch.nn.functional as F
 from .eva_clip.constants import OPENAI_DATASET_MEAN, OPENAI_DATASET_STD
 from .encoders_flux import IDFormer, PerceiverAttentionCA
 
+from .PulidFluxHook import set_model_patch_replace, forward_orig as plux_forward_orig
+
 INSIGHTFACE_DIR = os.path.join(folder_paths.models_dir, "insightface")
 
 MODELS_DIR = os.path.join(folder_paths.models_dir, "pulid")
@@ -285,7 +287,7 @@ class PulidFluxEvaClipLoader:
 
         return (model,)
 
-class ApplyPulidFlux:
+class ApplyPulidFlux_Old:
     @classmethod
     def INPUT_TYPES(s):
         return {
@@ -462,6 +464,183 @@ class ApplyPulidFlux:
         if self.pulid_data_dict:
             del self.pulid_data_dict['data'][self.pulid_data_dict['unique_id']]
             del self.pulid_data_dict
+
+
+class ApplyPulidFlux:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "model": ("MODEL", ),
+                "pulid_flux": ("PULIDFLUX", ),
+                "eva_clip": ("EVA_CLIP", ),
+                "face_analysis": ("FACEANALYSIS", ),
+                "image": ("IMAGE", ),
+                "weight": ("FLOAT", {"default": 1.0, "min": -1.0, "max": 5.0, "step": 0.05 }),
+                "start_at": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.001 }),
+                "end_at": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.001 }),
+            },
+            "optional": {
+                "attn_mask": ("MASK", ),
+            },
+            "hidden": {
+                "unique_id": "UNIQUE_ID"
+            },
+        }
+
+    RETURN_TYPES = ("MODEL",)
+    FUNCTION = "apply_pulid_flux"
+    CATEGORY = "pulid"
+
+    def apply_pulid_flux(self, model, pulid_flux, eva_clip, face_analysis, image, weight, start_at, end_at, attn_mask=None, unique_id=None):
+        # if not model.is_clone(model):
+        #     model = model.clone()
+        #     if not hasattr(model, "pulid_data"):
+        #         model.pulid_data = {}
+        model = model.clone()
+
+        device = comfy.model_management.get_torch_device()
+        # Why should I care what args say, when the unet model has a different dtype?!
+        # Am I missing something?!
+        #dtype = comfy.model_management.unet_dtype()
+        dtype = model.model.diffusion_model.dtype
+        # Because of 8bit models we must check what cast type does the unet uses
+        # ZLUDA (Intel, AMD) & GPUs with compute capability < 8.0 don't support bfloat16 etc.
+        # Issue: https://github.com/balazik/ComfyUI-PuLID-Flux/issues/6
+        if model.model.manual_cast_dtype is not None:
+            dtype = model.model.manual_cast_dtype
+
+        eva_clip.to(device, dtype=dtype)
+        pulid_flux.to(device, dtype=dtype)
+
+        # TODO: Add masking support!
+        if attn_mask is not None:
+            if attn_mask.dim() > 3:
+                attn_mask = attn_mask.squeeze(-1)
+            elif attn_mask.dim() < 3:
+                attn_mask = attn_mask.unsqueeze(0)
+            attn_mask = attn_mask.to(device, dtype=dtype)
+
+        image = tensor_to_image(image)
+
+        face_helper = FaceRestoreHelper(
+            upscale_factor=1,
+            face_size=512,
+            crop_ratio=(1, 1),
+            det_model='retinaface_resnet50',
+            save_ext='png',
+            device=device,
+        )
+
+        face_helper.face_parse = None
+        face_helper.face_parse = init_parsing_model(model_name='bisenet', device=device)
+
+        bg_label = [0, 16, 18, 7, 8, 9, 14, 15]
+        cond = []
+
+        # Analyse multiple images at multiple sizes and combine largest area embeddings
+        for i in range(image.shape[0]):
+            # get insightface embeddings
+            iface_embeds = None
+            for size in [(size, size) for size in range(640, 256, -64)]:
+                face_analysis.det_model.input_size = size
+                face_info = face_analysis.get(image[i])
+                if face_info:
+                    # Only use the maximum face
+                    # Removed the reverse=True from original code because we need the largest area not the smallest one!
+                    # Sorts the list in ascending order (smallest to largest),
+                    # then selects the last element, which is the largest face
+                    face_info = sorted(face_info, key=lambda x: (x.bbox[2] - x.bbox[0]) * (x.bbox[3] - x.bbox[1]))[-1]
+                    iface_embeds = torch.from_numpy(face_info.embedding).unsqueeze(0).to(device, dtype=dtype)
+                    break
+            else:
+                # No face detected, skip this image
+                logging.warning(f'Warning: No face detected in image {str(i)}')
+                continue
+
+            # get eva_clip embeddings
+            face_helper.clean_all()
+            face_helper.read_image(image[i])
+            face_helper.get_face_landmarks_5(only_center_face=True)
+            face_helper.align_warp_face()
+
+            if len(face_helper.cropped_faces) == 0:
+                # No face detected, skip this image
+                continue
+
+            # Get aligned face image
+            align_face = face_helper.cropped_faces[0]
+            # Convert bgr face image to tensor
+            align_face = image_to_tensor(align_face).unsqueeze(0).permute(0, 3, 1, 2).to(device)
+            parsing_out = face_helper.face_parse(functional.normalize(align_face, [0.485, 0.456, 0.406], [0.229, 0.224, 0.225]))[0]
+            parsing_out = parsing_out.argmax(dim=1, keepdim=True)
+            bg = sum(parsing_out == i for i in bg_label).bool()
+            white_image = torch.ones_like(align_face)
+            # Only keep the face features
+            face_features_image = torch.where(bg, white_image, to_gray(align_face))
+
+            # Transform img before sending to eva_clip
+            # Apparently MPS only supports NEAREST interpolation?
+            face_features_image = functional.resize(face_features_image, eva_clip.image_size, transforms.InterpolationMode.BICUBIC if 'cuda' in device.type else transforms.InterpolationMode.NEAREST).to(device, dtype=dtype)
+            face_features_image = functional.normalize(face_features_image, eva_clip.image_mean, eva_clip.image_std)
+
+            # eva_clip
+            id_cond_vit, id_vit_hidden = eva_clip(face_features_image, return_all_features=False, return_hidden=True, shuffle=False)
+            id_cond_vit = id_cond_vit.to(device, dtype=dtype)
+            for idx in range(len(id_vit_hidden)):
+                id_vit_hidden[idx] = id_vit_hidden[idx].to(device, dtype=dtype)
+
+            id_cond_vit = torch.div(id_cond_vit, torch.norm(id_cond_vit, 2, 1, True))
+
+            # Combine embeddings
+            id_cond = torch.cat([iface_embeds, id_cond_vit], dim=-1)
+
+            # Pulid_encoder
+            cond.append(pulid_flux.get_embeds(id_cond, id_vit_hidden))
+
+        if not cond:
+            # No faces detected, return the original model
+            logging.warning("PuLID warning: No faces detected in any of the given images, returning unmodified model.")
+            return (model,)
+
+        # average embeddings
+        cond = torch.cat(cond).to(device, dtype=dtype)
+        if cond.shape[0] > 1:
+            cond = torch.mean(cond, dim=0, keepdim=True)
+
+        sigma_start = model.get_model_object("model_sampling").percent_to_sigma(start_at)
+        sigma_end = model.get_model_object("model_sampling").percent_to_sigma(end_at)
+
+
+        flux_model = model.model.diffusion_model
+
+        if not hasattr(model, "pulid_hook"):
+            new_method = plux_forward_orig.__get__(flux_model, flux_model.__class__)
+            setattr(flux_model, 'forward_orig', new_method)
+
+        patch_kwargs = {
+            "pulid_model": pulid_flux,
+            "weight": weight,
+            "embedding": cond,
+            "sigma_start": sigma_start,
+            "sigma_end": sigma_end,
+            # don't know where to apply mask, ComfyUI have support attn_mask
+            # "mask": attn_mask
+        }
+
+        ca_idx = 0
+        for i in range(19):
+            if i % pulid_flux.double_interval == 0:
+                patch_kwargs["ca_idx"] = ca_idx
+                set_model_patch_replace(model, patch_kwargs, ("double_block", i))
+                ca_idx += 1
+        for i in range(38):
+            if i % pulid_flux.single_interval == 0:
+                patch_kwargs["ca_idx"] = ca_idx
+                set_model_patch_replace(model, patch_kwargs, ("single_block", i))
+                ca_idx += 1
+
+        return (model,)
 
 
 NODE_CLASS_MAPPINGS = {
