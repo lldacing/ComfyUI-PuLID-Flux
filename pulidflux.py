@@ -561,7 +561,7 @@ class ApplyPulidFlux:
             # get eva_clip embeddings
             face_helper.clean_all()
             face_helper.read_image(image[i])
-            face_helper.get_face_landmarks_5(only_center_face=True)
+            face_helper.get_face_landmarks_5(only_keep_largest=True)
             face_helper.align_warp_face()
 
             if len(face_helper.cropped_faces) == 0:
@@ -625,7 +625,7 @@ class ApplyPulidFlux:
             "sigma_start": sigma_start,
             "sigma_end": sigma_end,
             # don't know where to apply mask, ComfyUI have support attn_mask
-            # "mask": attn_mask
+            "mask": attn_mask
         }
 
         ca_idx = 0

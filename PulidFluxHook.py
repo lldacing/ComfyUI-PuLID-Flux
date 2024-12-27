@@ -23,9 +23,10 @@ def set_model_patch_replace(model, patch_kwargs, key):
     else:
         to["patches_replace"]["dit"][key].add(pulid_patch, **patch_kwargs)
 
-def pulid_patch(img, pulid_model=None, ca_idx=None, weight=1.0, embedding=None):
+def pulid_patch(img, pulid_model=None, ca_idx=None, weight=1.0, embedding=None, mask=None):
     # apply attn_mask in here?
     pulid_img = weight * pulid_model.pulid_ca[ca_idx].to(img.device)(embedding, img)
+
     return pulid_img
 
 
@@ -42,7 +43,7 @@ class DitDoubleBlockReplace:
             setattr(self, key, value)
 
     def __call__(self, input_args, extra_options):
-        sigma = input_args["timestep"]
+        sigma = input_args["timestep"][0]
         out = extra_options["original_block"](input_args)
         img = out['img']
         for i, callback in enumerate(self.callback):
@@ -51,7 +52,8 @@ class DitDoubleBlockReplace:
                                      pulid_model=self.kwargs[i]['pulid_model'],
                                      ca_idx=self.kwargs[i]['ca_idx'],
                                      weight=self.kwargs[i]['weight'],
-                                     embedding=self.kwargs[i]['embedding']
+                                     embedding=self.kwargs[i]['embedding'],
+                                     mask = self.kwargs[i]['mask'],
                                      )
 
         out['img'] = img
@@ -74,7 +76,7 @@ class DitSingleBlockReplace:
 
         out = extra_options["original_block"](input_args)
 
-        sigma = input_args["timestep"]
+        sigma = input_args["timestep"][0]
         img = out['img']
         txt = input_args['txt']
         real_img, txt = img[:, txt.shape[1]:, ...], img[:, :txt.shape[1], ...]
@@ -84,7 +86,8 @@ class DitSingleBlockReplace:
                                                pulid_model=self.kwargs[i]['pulid_model'],
                                                ca_idx=self.kwargs[i]['ca_idx'],
                                                weight=self.kwargs[i]['weight'],
-                                               embedding=self.kwargs[i]['embedding']
+                                               embedding=self.kwargs[i]['embedding'],
+                                               mask=self.kwargs[i]['mask'],
                                                )
         img = torch.cat((txt, real_img), 1)
 
